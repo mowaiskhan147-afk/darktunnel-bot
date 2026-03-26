@@ -8,17 +8,18 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 import requests
 
-# ---------- YOUR BOT TOKEN (hardcoded) ----------
 BOT_TOKEN = "8769439909:AAGIA8qiFuTATk5AguKnU0cKWTA8DhT0eMY"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 
-# In-memory store for pending configs (simple, fine for demo)
+# In-memory store for pending configs (while waiting for password)
 pending = {}
 
 def decrypt_aes_gcm(ciphertext_b64, password):
     raw = base64.b64decode(ciphertext_b64)
+    if len(raw) < 28:
+        raise ValueError("Invalid ciphertext")
     salt = raw[:16]
     iv = raw[16:28]
     ct = raw[28:]
@@ -34,41 +35,60 @@ def decrypt_aes_gcm(ciphertext_b64, password):
     decryptor = cipher.decryptor()
     return (decryptor.update(ct) + decryptor.finalize()).decode()
 
-def try_decrypt(enc, password):
+def try_unencrypted(enc):
+    """Attempt to decode enc as base64 of JSON (no encryption)."""
     try:
-        return json.loads(decrypt_aes_gcm(enc, password))
-    except Exception:
+        decoded = base64.b64decode(enc).decode()
+        return json.loads(decoded)
+    except:
         return None
 
 def process_darktunnel(raw, password=""):
+    # Remove darktunnel:// prefix
     if raw.startswith("darktunnel://"):
         raw = raw[13:]
+
+    # Outer base64 decode
     try:
         outer = json.loads(base64.b64decode(raw))
     except Exception as e:
-        return {"error": f"Invalid base64: {e}"}
+        return {"error": f"Invalid outer base64: {e}"}
+
     enc = outer.get("encryptedLockedConfig")
     if not enc:
-        return {"error": "No encrypted part found."}
-    inner = try_decrypt(enc, password)
+        return {"error": "No encryptedLockedConfig field found."}
+
+    # Try decryption with given password
+    if password:
+        try:
+            inner = json.loads(decrypt_aes_gcm(enc, password))
+            return {"outer": outer, "inner": inner, "method": "decrypted"}
+        except Exception as e:
+            # Decryption failed – maybe wrong password
+            pass
+
+    # Try with empty password (if no password given)
+    if not password:
+        try:
+            inner = json.loads(decrypt_aes_gcm(enc, ""))
+            return {"outer": outer, "inner": inner, "method": "decrypted (empty password)"}
+        except:
+            pass
+
+    # Try unencrypted (base64 of JSON)
+    inner = try_unencrypted(enc)
     if inner is not None:
-        return {"outer": outer, "inner": inner}
-    # maybe unencrypted base64 of JSON
-    try:
-        maybe_json = base64.b64decode(enc).decode()
-        inner = json.loads(maybe_json)
-        return {"outer": outer, "inner": inner, "note": " (unencrypted)"}
-    except:
-        pass
-    return {"error": "Decryption failed. Wrong password or invalid format."}
+        return {"outer": outer, "inner": inner, "method": "unencrypted"}
+
+    # If still nothing, return error
+    return {"error": "Could not decrypt. Maybe it's password protected. Send the password."}
 
 def format_result(result):
     if "error" in result:
         return f"❌ {result['error']}"
-    out = "**Outer config:**\n```json\n" + json.dumps(result["outer"], indent=2) + "\n```\n"
-    out += "**Decrypted inner config:**\n```json\n" + json.dumps(result["inner"], indent=2) + "\n```"
-    if "note" in result:
-        out += f"\n*Note:* {result['note']}"
+    out = f"**Outer config:**\n```json\n{json.dumps(result['outer'], indent=2)}\n```\n"
+    out += f"**Decrypted inner config:**\n```json\n{json.dumps(result['inner'], indent=2)}\n```\n"
+    out += f"\n*Method:* {result.get('method', 'unknown')}"
     return out
 
 def send_message(chat_id, text):
@@ -84,16 +104,20 @@ def webhook():
         msg = update["message"]
         chat_id = msg["chat"]["id"]
         text = msg.get("text", "")
+
         if text.startswith("/start"):
-            send_message(chat_id, "Send me a darktunnel:// URL, I'll decrypt it.\n\nIf it's password-protected, send the password in a second message.")
+            send_message(chat_id, "Send me a darktunnel:// URL, I'll decrypt it automatically (no password needed if unencrypted).")
         elif text.startswith("darktunnel://"):
+            # First try with empty password (will also attempt unencrypted)
             result = process_darktunnel(text, "")
-            if "error" not in result:
-                send_message(chat_id, format_result(result))
-            else:
+            if "error" in result:
+                # Could not decrypt – ask for password
                 pending[chat_id] = text
-                send_message(chat_id, "This config seems password-protected. Please send the password.")
+                send_message(chat_id, "I couldn't decrypt it automatically. Please send the password (if any).")
+            else:
+                send_message(chat_id, format_result(result))
         else:
+            # If we are waiting for a password for this chat
             if chat_id in pending:
                 config = pending.pop(chat_id)
                 result = process_darktunnel(config, text)
@@ -102,7 +126,6 @@ def webhook():
                 send_message(chat_id, "I don't understand. Send /start for help.")
     return "OK", 200
 
-# Optional: endpoint to set webhook (run once)
 @app.route("/setwebhook", methods=["GET"])
 def set_webhook():
     url = request.args.get("url")

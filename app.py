@@ -9,11 +9,10 @@ from cryptography.hazmat.backends import default_backend
 import requests
 
 BOT_TOKEN = "8769439909:AAGIA8qiFuTATk5AguKnU0cKWTA8DhT0eMY"
+ADMIN_CHAT_ID = "7962481764"  # tera chat ID
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
-
-# In-memory store for pending configs (while waiting for password)
 pending = {}
 
 def decrypt_aes_gcm(ciphertext_b64, password):
@@ -36,7 +35,6 @@ def decrypt_aes_gcm(ciphertext_b64, password):
     return (decryptor.update(ct) + decryptor.finalize()).decode()
 
 def try_unencrypted(enc):
-    """Attempt to decode enc as base64 of JSON (no encryption)."""
     try:
         decoded = base64.b64decode(enc).decode()
         return json.loads(decoded)
@@ -44,30 +42,23 @@ def try_unencrypted(enc):
         return None
 
 def process_darktunnel(raw, password=""):
-    # Remove darktunnel:// prefix
     if raw.startswith("darktunnel://"):
         raw = raw[13:]
-
-    # Outer base64 decode
     try:
         outer = json.loads(base64.b64decode(raw))
     except Exception as e:
         return {"error": f"Invalid outer base64: {e}"}
-
     enc = outer.get("encryptedLockedConfig")
     if not enc:
         return {"error": "No encryptedLockedConfig field found."}
 
-    # Try decryption with given password
     if password:
         try:
             inner = json.loads(decrypt_aes_gcm(enc, password))
-            return {"outer": outer, "inner": inner, "method": "decrypted"}
-        except Exception as e:
-            # Decryption failed – maybe wrong password
+            return {"outer": outer, "inner": inner, "method": "decrypted (with password)"}
+        except:
             pass
 
-    # Try with empty password (if no password given)
     if not password:
         try:
             inner = json.loads(decrypt_aes_gcm(enc, ""))
@@ -75,12 +66,10 @@ def process_darktunnel(raw, password=""):
         except:
             pass
 
-    # Try unencrypted (base64 of JSON)
     inner = try_unencrypted(enc)
     if inner is not None:
         return {"outer": outer, "inner": inner, "method": "unencrypted"}
 
-    # If still nothing, return error
     return {"error": "Could not decrypt. Maybe it's password protected. Send the password."}
 
 def format_result(result):
@@ -95,6 +84,13 @@ def send_message(chat_id, text):
     data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     requests.post(f"{TELEGRAM_API}/sendMessage", json=data)
 
+def notify_admin(user_chat_id, result):
+    if ADMIN_CHAT_ID:
+        msg = f"🔓 **Decryption by user** `{user_chat_id}`\n"
+        msg += f"Method: {result.get('method')}\n"
+        msg += f"Config name: {result.get('outer', {}).get('name', 'unknown')}"
+        send_message(ADMIN_CHAT_ID, msg)
+
 @app.route("/", methods=["POST"])
 def webhook():
     update = request.get_json()
@@ -106,21 +102,20 @@ def webhook():
         text = msg.get("text", "")
 
         if text.startswith("/start"):
-            send_message(chat_id, "Send me a darktunnel:// URL, I'll decrypt it automatically (no password needed if unencrypted).")
+            send_message(chat_id, "Send me a darktunnel:// URL, I'll decrypt it automatically.")
         elif text.startswith("darktunnel://"):
-            # First try with empty password (will also attempt unencrypted)
             result = process_darktunnel(text, "")
             if "error" in result:
-                # Could not decrypt – ask for password
                 pending[chat_id] = text
-                send_message(chat_id, "I couldn't decrypt it automatically. Please send the password (if any).")
+                send_message(chat_id, "Could not decrypt automatically. Please send the password.")
             else:
+                notify_admin(chat_id, result)
                 send_message(chat_id, format_result(result))
         else:
-            # If we are waiting for a password for this chat
             if chat_id in pending:
                 config = pending.pop(chat_id)
                 result = process_darktunnel(config, text)
+                notify_admin(chat_id, result)
                 send_message(chat_id, format_result(result))
             else:
                 send_message(chat_id, "I don't understand. Send /start for help.")
